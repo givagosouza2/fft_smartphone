@@ -6,7 +6,8 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 from scipy.spatial import ConvexHull
-from scipy.stats import entropy as scipy_entropy
+from scipy.stats import entropy as scipy_entropy, gaussian_kde
+from scipy.ndimage import maximum_filter
 
 st.set_page_config(page_title='Finger Tapping Test — Análise Quantitativa', layout='wide')
 
@@ -232,7 +233,137 @@ def safe_cv(x):
     return float(100*np.std(x, ddof=1)/np.mean(x))
 
 
-def compute_metrics(df, time_unit='ms', grid_n=8, target_x=None, target_y=None):
+
+def kde2d_metrics(x, y, grid_size=180, bw_method='scott', levels=(0.50,0.75,0.90,0.95),
+                  target_x=None, target_y=None, target_radius=None):
+    """2D Gaussian KDE plus quantitative HDR metrics.
+
+    HDR areas are the smallest grid areas containing the requested probability mass.
+    Values are returned together with the evaluated grid for plotting.
+    """
+    x=np.asarray(x,float); y=np.asarray(y,float)
+    mask=np.isfinite(x)&np.isfinite(y)
+    x=x[mask]; y=y[mask]
+    if len(x)<3 or np.ptp(x)<=EPS or np.ptp(y)<=EPS:
+        return None
+
+    # modest padding avoids clipping density tails at the observed extrema
+    padx=max(np.ptp(x)*0.15, 1.0); pady=max(np.ptp(y)*0.15, 1.0)
+    xmin,xmax=x.min()-padx,x.max()+padx
+    ymin,ymax=y.min()-pady,y.max()+pady
+    gx=np.linspace(xmin,xmax,grid_size); gy=np.linspace(ymin,ymax,grid_size)
+    Xg,Yg=np.meshgrid(gx,gy)
+    pos=np.vstack([Xg.ravel(),Yg.ravel()])
+    try:
+        kde=gaussian_kde(np.vstack([x,y]), bw_method=bw_method)
+        Z=kde(pos).reshape(grid_size,grid_size)
+    except Exception:
+        return None
+
+    dxg=gx[1]-gx[0]; dyg=gy[1]-gy[0]; cell_area=dxg*dyg
+    mass=Z*cell_area
+    total_mass=mass.sum()
+    if total_mass<=EPS:
+        return None
+    mass=mass/total_mass
+    Znorm=Z/total_mass
+
+    imax=np.unravel_index(np.argmax(Znorm),Znorm.shape)
+    mode_x=float(Xg[imax]); mode_y=float(Yg[imax]); peak=float(Znorm[imax])
+    mean_density=float(np.mean(Znorm))
+    peak_mean=float(peak/mean_density) if mean_density>EPS else np.nan
+
+    flatZ=Znorm.ravel(); flatM=mass.ravel()
+    order=np.argsort(flatZ)[::-1]
+    cum=np.cumsum(flatM[order])
+    hdr_areas={}; thresholds={}
+    for lev in levels:
+        k=int(np.searchsorted(cum,lev,side='left'))
+        k=min(k,len(order)-1)
+        thr=float(flatZ[order[k]])
+        thresholds[lev]=thr
+        hdr_areas[lev]=float(np.sum(Znorm>=thr)*cell_area)
+
+    # Differential entropy of the discretized KDE density (bits).
+    p=mass.ravel(); p=p[p>0]
+    kent=float(-np.sum(p*np.log2(p)))
+
+    # Count prominent local maxima; threshold at 5% of global peak and separate by ~5 grid cells.
+    neighborhood=11
+    local=(Znorm==maximum_filter(Znorm,size=neighborhood,mode='nearest'))
+    prominent=local & (Znorm>=0.05*peak)
+    n_peaks=int(np.sum(prominent))
+
+    out={
+        'KDE - densidade máxima (1/px²)':peak,
+        'KDE - modo X (px)':mode_x,
+        'KDE - modo Y (px)':mode_y,
+        'KDE - razão pico/média':peak_mean,
+        'KDE - entropia espacial discreta (bits)':kent,
+        'KDE - número de picos proeminentes':n_peaks,
+    }
+    for lev in levels:
+        out[f'KDE - área HDR {int(lev*100)}% (px²)']=hdr_areas[lev]
+
+    if target_x is not None and target_y is not None:
+        out['KDE - distância do modo ao centro do alvo (px)']=float(np.hypot(mode_x-target_x,mode_y-target_y))
+        # density at target centre
+        try:
+            out['KDE - densidade no centro do alvo (1/px²)']=float(kde(np.array([[target_x],[target_y]]))[0]/total_mass)
+        except Exception:
+            out['KDE - densidade no centro do alvo (1/px²)']=np.nan
+        if target_radius is not None and target_radius>0:
+            inside=((Xg-target_x)**2+(Yg-target_y)**2)<=target_radius**2
+            out['KDE - massa de probabilidade dentro do alvo (%)']=float(100*mass[inside].sum())
+
+    return {'metrics':out,'gx':gx,'gy':gy,'X':Xg,'Y':Yg,'Z':Znorm,'mass':mass,
+            'thresholds':thresholds,'mode':(mode_x,mode_y),'peak_mask':prominent}
+
+
+def kde_overlap(kde_a, kde_b):
+    """Histogram-intersection overlap of two KDEs evaluated on the same grid."""
+    if kde_a is None or kde_b is None:
+        return np.nan
+    if kde_a['mass'].shape != kde_b['mass'].shape:
+        return np.nan
+    return float(np.minimum(kde_a['mass'],kde_b['mass']).sum())
+
+
+def temporal_kde_comparison(df, grid_size=160, bw_method='scott'):
+    """Early/middle/late KDEs on one common grid, returning drift/area/overlap metrics."""
+    n=len(df)
+    if n<9:
+        return None
+    parts=np.array_split(np.arange(n),3)
+    x=df['X'].to_numpy(float); y=df['Y'].to_numpy(float)
+    padx=max(np.ptp(x)*0.15,1.0); pady=max(np.ptp(y)*0.15,1.0)
+    gx=np.linspace(x.min()-padx,x.max()+padx,grid_size); gy=np.linspace(y.min()-pady,y.max()+pady,grid_size)
+    Xg,Yg=np.meshgrid(gx,gy); pos=np.vstack([Xg.ravel(),Yg.ravel()])
+    cell=(gx[1]-gx[0])*(gy[1]-gy[0])
+    out=[]
+    for ids in parts:
+        xx=x[ids]; yy=y[ids]
+        try:
+            k=gaussian_kde(np.vstack([xx,yy]),bw_method=bw_method)
+            Z=k(pos).reshape(grid_size,grid_size)
+        except Exception:
+            return None
+        m=Z*cell; m=m/m.sum(); Z=Z/m.sum()
+        im=np.unravel_index(np.argmax(Z),Z.shape)
+        order=np.argsort(Z.ravel())[::-1]; cum=np.cumsum(m.ravel()[order]); kk=np.searchsorted(cum,.90)
+        thr=Z.ravel()[order[min(kk,len(order)-1)]]; area90=float(np.sum(Z>=thr)*cell)
+        out.append({'mass':m,'Z':Z,'mode':(float(Xg[im]),float(Yg[im])),'area90':area90})
+    m0,m1,m2=out
+    overlap_early_late=float(np.minimum(m0['mass'],m2['mass']).sum())
+    drift=float(np.hypot(m2['mode'][0]-m0['mode'][0],m2['mode'][1]-m0['mode'][1]))
+    return {
+        'KDE dinâmica - deslocamento do modo inicial→final (px)':drift,
+        'KDE dinâmica - mudança da área HDR90 final-inicial (px²)':m2['area90']-m0['area90'],
+        'KDE dinâmica - razão área HDR90 final/inicial':m2['area90']/m0['area90'] if m0['area90']>EPS else np.nan,
+        'KDE dinâmica - sobreposição inicial-final':overlap_early_late,
+    }, out, gx, gy
+
+def compute_metrics(df, time_unit='ms', grid_n=8, target_x=None, target_y=None, target_radius=None, kde_grid=180, kde_bw='scott'):
     t_raw = df['TEMPO'].to_numpy(float)
     t_s = t_raw / 1000.0 if time_unit == 'ms' else t_raw.copy()
     x = df['X'].to_numpy(float)
@@ -277,6 +408,8 @@ def compute_metrics(df, time_unit='ms', grid_n=8, target_x=None, target_y=None):
     path_eff = float(net_disp/total_dist) if total_dist > EPS else np.nan
     cx, cy = float(np.mean(x)), float(np.mean(y))
     radial = np.hypot(x-cx, y-cy)
+    kde_res = kde2d_metrics(x, y, grid_size=kde_grid, bw_method=kde_bw, target_x=target_x, target_y=target_y, target_radius=target_radius)
+    dyn_kde = temporal_kde_comparison(df, grid_size=min(kde_grid,160), bw_method=kde_bw)
 
     metrics = {
         'Número de toques': len(df),
@@ -338,6 +471,11 @@ def compute_metrics(df, time_unit='ms', grid_n=8, target_x=None, target_y=None):
         'Drift radial do centróide (px/s)': linear_slope(elapsed, radial),
     }
 
+    if kde_res is not None:
+        metrics.update(kde_res['metrics'])
+    if dyn_kde is not None:
+        metrics.update(dyn_kde[0])
+
     if target_x is not None and target_y is not None:
         err = np.hypot(x-target_x, y-target_y)
         metrics.update({
@@ -359,7 +497,7 @@ def compute_metrics(df, time_unit='ms', grid_n=8, target_x=None, target_y=None):
         'velocidade_px_s': inst_speed,
         'angulo_graus': np.degrees(angles) % 360,
     })
-    return metrics, step_df, weighted, unweighted
+    return metrics, step_df, weighted, unweighted, kde_res, dyn_kde
 
 
 def ellipse_trace_from_anisotropy(result, scale=2.0, n=240):
@@ -419,11 +557,15 @@ with st.sidebar:
     time_unit = st.radio('Unidade da coluna de tempo', ['ms','s'], index=0, horizontal=True)
     grid_n = st.slider('Grade da entropia espacial', 3, 20, 8)
     window_s = st.slider('Janela para análise dinâmica (s)', 2, 15, 5)
+    st.subheader('Kernel Density Estimation (KDE)')
+    kde_grid = st.slider('Resolução da grade KDE', 80, 300, 180, 20)
+    kde_bw = st.selectbox('Bandwidth da KDE', ['scott','silverman'], index=0)
     st.divider()
     st.subheader('Centro do alvo (opcional)')
     use_target = st.checkbox('Informar coordenadas do centro do alvo')
     target_x = st.number_input('X do alvo (px)', value=0.0) if use_target else None
     target_y = st.number_input('Y do alvo (px)', value=0.0) if use_target else None
+    target_radius = st.number_input('Raio do alvo (px, opcional)', min_value=0.0, value=0.0, step=1.0) if use_target else 0.0
     st.caption('Se o centro real do alvo for fornecido, o app calcula erro, RMSE e bias espacial.')
 
 if uploaded is None:
@@ -439,10 +581,12 @@ if len(df) < 3:
     st.error('São necessários pelo menos 3 eventos de toque para a maior parte das análises.')
     st.stop()
 
-metrics, steps, weighted, unweighted = compute_metrics(
+metrics, steps, weighted, unweighted, kde_res, dyn_kde = compute_metrics(
     df, time_unit=time_unit, grid_n=grid_n,
     target_x=target_x if use_target else None,
-    target_y=target_y if use_target else None
+    target_y=target_y if use_target else None,
+    target_radius=target_radius if use_target and target_radius>0 else None,
+    kde_grid=kde_grid, kde_bw=kde_bw
 )
 
 # Summary cards
@@ -465,7 +609,7 @@ st.download_button('Baixar métricas (.csv)', csv_metrics, 'FTT_metricas.csv', '
 st.divider()
 st.header('Visualizações')
 
-tabs = st.tabs(['Trajetória', 'Vetores orientacionais', 'Tempo', 'Distribuições', 'Dinâmica por janelas', 'Dados'])
+tabs = st.tabs(['Trajetória', 'KDE espacial', 'Vetores orientacionais', 'Tempo', 'Distribuições', 'Dinâmica por janelas', 'Dados'])
 
 with tabs[0]:
     fig = go.Figure()
@@ -490,7 +634,52 @@ with tabs[0]:
     fig2.update_yaxes(scaleanchor='x', scaleratio=1)
     st.plotly_chart(fig2, use_container_width=True)
 
+
 with tabs[1]:
+    st.subheader('Kernel Density Estimation 2D')
+    if kde_res is None:
+        st.warning('Não foi possível calcular a KDE para este conjunto de pontos.')
+    else:
+        figk = go.Figure(data=go.Contour(
+            x=kde_res['gx'], y=kde_res['gy'], z=kde_res['Z'],
+            contours=dict(coloring='heatmap', showlabels=True),
+            colorbar=dict(title='Densidade')
+        ))
+        figk.add_trace(go.Scatter(x=df['X'], y=df['Y'], mode='markers',
+                                  marker=dict(size=4, opacity=.35), name='Toques'))
+        mx,my=kde_res['mode']
+        figk.add_trace(go.Scatter(x=[mx],y=[my],mode='markers',marker=dict(size=13,symbol='x'),name='Modo KDE'))
+        if use_target:
+            figk.add_trace(go.Scatter(x=[target_x],y=[target_y],mode='markers',marker=dict(size=13,symbol='cross'),name='Centro alvo'))
+            if target_radius>0:
+                th=np.linspace(0,2*np.pi,240)
+                figk.add_trace(go.Scatter(x=target_x+target_radius*np.cos(th), y=target_y+target_radius*np.sin(th),
+                                          mode='lines', name='Limite do alvo'))
+        figk.update_layout(title='KDE gaussiana 2D dos locais de toque',xaxis_title='X (px)',yaxis_title='Y (px)',
+                           yaxis=dict(scaleanchor='x',scaleratio=1),height=650)
+        st.plotly_chart(figk,use_container_width=True)
+
+        rows=[]
+        for lev,thr in kde_res['thresholds'].items():
+            area=metrics.get(f'KDE - área HDR {int(lev*100)}% (px²)',np.nan)
+            rows.append({'HDR':f'{int(lev*100)}%','Limiar de densidade':thr,'Área (px²)':area})
+        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+        st.caption('HDR = Highest Density Region: menor região da KDE que contém a fração indicada da massa de probabilidade.')
+
+        if dyn_kde is not None:
+            st.subheader('Mudança da densidade ao longo do teste')
+            dyn_metrics,parts,gx,gy=dyn_kde
+            labels=['Inicial','Intermediário','Final']
+            figd=go.Figure()
+            for lab,part in zip(labels,parts):
+                figd.add_trace(go.Contour(x=gx,y=gy,z=part['Z'],showscale=False,contours=dict(coloring='lines'),name=lab,opacity=.75))
+            figd.update_layout(title='Contornos KDE — primeiro, segundo e terceiro terços',xaxis_title='X (px)',yaxis_title='Y (px)',
+                               yaxis=dict(scaleanchor='x',scaleratio=1),height=600)
+            st.plotly_chart(figd,use_container_width=True)
+            st.dataframe(pd.DataFrame({'Variável':list(dyn_metrics.keys()),'Valor':list(dyn_metrics.values())}),
+                         use_container_width=True,hide_index=True)
+
+with tabs[2]:
     dx = np.diff(df['X'].to_numpy(float)); dy = np.diff(df['Y'].to_numpy(float))
     norm = np.hypot(dx,dy)
     keep = norm > EPS
@@ -525,7 +714,7 @@ with tabs[1]:
     figpolar.update_layout(title='Distribuição polar dos vetores (raio = magnitude do deslocamento)', height=600)
     st.plotly_chart(figpolar,use_container_width=True)
 
-with tabs[2]:
+with tabs[3]:
     fig=go.Figure()
     fig.add_trace(go.Scatter(x=steps['tempo_s'], y=steps['intervalo_ms'], mode='lines+markers', name='ITI'))
     fig.update_layout(title='Intervalo entre toques ao longo do teste', xaxis_title='Tempo (s)', yaxis_title='ITI (ms)', height=450)
@@ -541,7 +730,7 @@ with tabs[2]:
     fig.update_layout(title='Velocidade espacial entre eventos', xaxis_title='Tempo (s)', yaxis_title='px/s', height=450)
     st.plotly_chart(fig,use_container_width=True)
 
-with tabs[3]:
+with tabs[4]:
     c1,c2=st.columns(2)
     with c1:
         st.plotly_chart(px.histogram(steps,x='intervalo_ms',nbins=30,title='Distribuição dos intervalos'),use_container_width=True)
@@ -551,7 +740,7 @@ with tabs[3]:
         st.plotly_chart(px.scatter(steps,x='intervalo_ms',y='distancia_px',trendline=None,
                                    title='Relação ITI × distância'),use_container_width=True)
 
-with tabs[4]:
+with tabs[5]:
     win = window_metrics(df,time_unit,window_s)
     st.dataframe(win,use_container_width=True,hide_index=True)
     if not win.empty:
@@ -566,7 +755,7 @@ with tabs[4]:
         st.download_button('Baixar métricas por janela (.csv)', win.to_csv(index=False).encode('utf-8-sig'),
                            'FTT_metricas_janelas.csv','text/csv')
 
-with tabs[5]:
+with tabs[6]:
     st.write('Eventos originais')
     st.dataframe(df,use_container_width=True,hide_index=True)
     st.write('Variáveis derivadas entre toques consecutivos')
@@ -591,4 +780,7 @@ with st.expander('Observações metodológicas'):
 - As entropias dependem da quantidade de dados e da discretização. Para comparações entre participantes, mantenha os mesmos parâmetros.
 - A elipse espacial de 95% é calculada sobre as **posições dos toques**; os índices orientacionais são calculados sobre os **vetores entre toques** e representam conceitos diferentes.
 - O centro do alvo não é inferido automaticamente, porque isso confundiria precisão observada com a localização real do estímulo. Quando conhecido, informe-o na barra lateral.
+- A KDE usa kernel gaussiano bidimensional. As áreas HDR 50/75/90/95% representam as menores regiões que concentram essas proporções da massa estimada.
+- A massa KDE dentro do alvo só é calculada quando centro e raio do alvo são informados.
+- O número de picos da KDE depende do bandwidth; por isso, para comparações entre participantes, mantenha o mesmo método de bandwidth e a mesma resolução de grade.
 ''')
